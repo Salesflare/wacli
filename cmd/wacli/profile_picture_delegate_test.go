@@ -163,3 +163,42 @@ func TestReadOnlyPictureInfoRefusesGroups(t *testing.T) {
 		t.Fatalf("group err=%v stdout=%q stderr=%q", err, stdout, stderr)
 	}
 }
+
+func TestPictureBudgetFailsClosedOnUntrustedState(t *testing.T) {
+	for name, content := range map[string]string{
+		"bad count": "2026-10-24 invalid\n",
+		"bad day":   "yesterday 3\n",
+		"negative":  "2026-10-24 -1\n",
+		"extra":     "2026-10-24 1 2\n",
+		"empty":     "",
+	} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, profilePictureBudgetFile), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		getter := &fakePictureGetter{info: &types.ProfilePictureInfo{ID: "1", URL: "https://pps.whatsapp.net/x"}}
+		_, err := executeDelegatedProfilePicture(context.Background(), getter, newPictureBudget(dir, 5), pictureRequest("15551234567@s.whatsapp.net"))
+		if err == nil || !strings.Contains(err.Error(), "fix or remove it") {
+			t.Fatalf("%s: error = %v, want fail closed", name, err)
+		}
+		if len(getter.calls) != 0 {
+			t.Fatalf("%s: queried WhatsApp with an untrusted budget", name)
+		}
+		if raw, _ := os.ReadFile(filepath.Join(dir, profilePictureBudgetFile)); string(raw) != content {
+			t.Fatalf("%s: budget file rewritten to %q", name, raw)
+		}
+	}
+
+	// Unreadable (here: a directory where the file belongs) is refused too.
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, profilePictureBudgetFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := newPictureBudget(dir, 5).take(); err == nil || !strings.Contains(err.Error(), "fix or remove it") {
+		t.Fatalf("unreadable budget: error = %v, want fail closed", err)
+	}
+	// With the budget off, the file is not even read.
+	if err := newPictureBudget(dir, 0).take(); !errors.Is(err, errProfilePictureDelegateOff) {
+		t.Fatalf("off budget: error = %v", err)
+	}
+}

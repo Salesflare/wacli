@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,31 +35,45 @@ const (
 var errProfilePictureDelegateOff = errors.New("profile picture queries are off in this sync process; start it with --profile-picture-budget N")
 
 type pictureBudget struct {
-	mu   sync.Mutex
-	max  int
-	path string
-	day  string
-	used int
-	now  func() time.Time
+	mu     sync.Mutex
+	max    int
+	path   string
+	day    string
+	used   int
+	broken error // the saved count can't be trusted: refuse instead of starting over
+	now    func() time.Time
 }
 
 // newPictureBudget loads today's count from the store directory. max <= 0 turns
-// delegated picture queries off.
+// delegated picture queries off. A missing file is a fresh start; an unreadable
+// or malformed one makes every query fail closed until it is fixed or removed.
 func newPictureBudget(storeDir string, max int) *pictureBudget {
 	b := &pictureBudget{max: max, now: time.Now}
 	if storeDir != "" {
 		b.path = filepath.Join(storeDir, profilePictureBudgetFile)
 	}
-	if b.path != "" {
-		if raw, err := os.ReadFile(b.path); err == nil {
-			fields := strings.Fields(string(raw))
-			if len(fields) == 2 {
-				if n, err := strconv.Atoi(fields[1]); err == nil && n >= 0 {
-					b.day, b.used = fields[0], n
-				}
-			}
+	if b.path == "" || max <= 0 {
+		return b
+	}
+	raw, err := os.ReadFile(b.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return b
+	}
+	if err != nil {
+		b.broken = fmt.Errorf("read profile picture budget %s: %w; fix or remove it", b.path, err)
+		return b
+	}
+	fields := strings.Fields(string(raw))
+	var n int
+	if len(fields) == 2 {
+		_, dayErr := time.Parse("2006-01-02", fields[0])
+		n, err = strconv.Atoi(fields[1])
+		if dayErr == nil && err == nil && n >= 0 {
+			b.day, b.used = fields[0], n
+			return b
 		}
 	}
+	b.broken = fmt.Errorf("profile picture budget %s is not \"YYYY-MM-DD COUNT\"; fix or remove it", b.path)
 	return b
 }
 
@@ -69,6 +84,9 @@ func (b *pictureBudget) take() error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.broken != nil {
+		return b.broken
+	}
 	today := b.now().UTC().Format("2006-01-02")
 	if b.day != today {
 		b.day, b.used = today, 0
@@ -102,10 +120,32 @@ func writePrivateFileAtomic(path string, data []byte) error {
 		_ = tmp.Close()
 		return err
 	}
+	// The count must be on disk before the query it pays for.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// syncDir makes a rename in dir durable. Windows has no directory fsync; there
+// MoveFileEx (os.Rename) is the durable step.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 type profilePictureGetter interface {
