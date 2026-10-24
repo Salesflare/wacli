@@ -1,0 +1,300 @@
+name: Fork update
+
+# Daily: move the fork onto the newest upstream release tag and release it.
+# How it works and what to do when it asks for help: .github/fork/README.md
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: "Reviewed branch to make the new main, e.g. fork/ai-update-v0.26.0 (empty: normal run)"
+        required: false
+        default: ""
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: fork-update
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  GIT_AUTHOR_NAME: github-actions[bot]
+  GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+  GIT_COMMITTER_NAME: github-actions[bot]
+  GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+jobs:
+  update:
+    if: ${{ !inputs.promote }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      state: ${{ steps.update.outputs.state }}
+      base: ${{ steps.update.outputs.base }}
+      latest: ${{ steps.update.outputs.latest }}
+      gate: ${{ steps.gate.outputs.gate }}
+      release: ${{ steps.plan.outputs.release }}
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ secrets.FORK_BOT_TOKEN || github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.FORK_BOT_TOKEN || github.token }}
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Rebase onto the newest upstream release
+        id: update
+        run: bash .github/fork/update.sh
+
+      - name: Gate
+        id: gate
+        if: steps.update.outputs.state == 'rebased'
+        run: |
+          if bash .github/fork/test.sh; then echo "gate=pass" >>"$GITHUB_OUTPUT"; else echo "gate=fail" >>"$GITHUB_OUTPUT"; fi
+
+      - name: Land the rebase (PR, checks, main)
+        if: steps.update.outputs.state == 'rebased' && steps.gate.outputs.gate == 'pass'
+        env:
+          BRANCH: ${{ steps.update.outputs.branch }}
+          BASE: ${{ steps.update.outputs.base }}
+          LATEST: ${{ steps.update.outputs.latest }}
+          OLD_HEAD: ${{ steps.update.outputs.old_head }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash .github/fork/land.sh
+
+      - name: Follow upstream (it ships the patch now)
+        if: steps.update.outputs.state == 'upstream-has-patch'
+        env:
+          BRANCH: ${{ steps.update.outputs.branch }}
+          LATEST: ${{ steps.update.outputs.latest }}
+          OLD_HEAD: ${{ steps.update.outputs.old_head }}
+        run: |
+          set -euo pipefail
+          git push --force-with-lease="main:$OLD_HEAD" origin "HEAD:main"
+          bash .github/fork/issue.sh "Upstream $LATEST ships the profile picture budget: switch back to openclaw/wacli" \
+            "Upstream $LATEST contains \`--profile-picture-budget\`, so this fork's patch is no longer needed. main now tracks upstream $LATEST plus only the fork tooling, and no new fork release is made. Switch installs back to openclaw/wacli releases (and bump The Machine's pin), then archive this fork."
+
+      - name: Plan the release
+        id: plan
+        if: steps.update.outputs.state == 'current' || (steps.update.outputs.state == 'rebased' && steps.gate.outputs.gate == 'pass')
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          git checkout --quiet --detach origin/main
+          bash .github/fork/release-plan.sh
+
+  ai:
+    needs: update
+    if: needs.update.outputs.state == 'conflict' || needs.update.outputs.gate == 'fail'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.FORK_BOT_TOKEN || github.token }}
+      BASE: ${{ needs.update.outputs.base }}
+      LATEST: ${{ needs.update.outputs.latest }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.FORK_BOT_TOKEN || github.token }}
+
+      - name: Already waiting for review?
+        id: open
+        run: |
+          set -euo pipefail
+          n=$(gh pr list --head "fork/ai-update-$LATEST" --state open --json number --jq length)
+          echo "open=$([ "$n" -gt 0 ] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+
+      - name: Is the AI provider set up?
+        id: provider
+        if: steps.open.outputs.open == 'false'
+        env:
+          KEY: ${{ secrets.AZURE_APIM_KEY_REVIEWER }}
+          BASE_URL: ${{ vars.AZURE_APIM_BASE_URL_REVIEWER }}
+          MODEL: ${{ vars.AZURE_OPENAI_MODEL_REVIEWER }}
+        run: |
+          if [ -n "$KEY" ] && [ -n "$BASE_URL" ] && [ -n "$MODEL" ]; then echo "ready=true"; else echo "ready=false"; fi >>"$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        if: steps.provider.outputs.ready == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Node
+        if: steps.provider.outputs.ready == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install Codex CLI
+        if: steps.provider.outputs.ready == 'true'
+        run: |
+          npm install -g @openai/codex@0.164.0
+          codex --version
+
+      - name: Prepare the Linux sandbox for Codex
+        if: steps.provider.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [ -n "$userns" ] && [ "$userns" != "1" ]; then sudo sysctl -w kernel.unprivileged_userns_clone=1; fi
+          apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [ -n "$apparmor" ] && [ "$apparmor" != "0" ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
+
+      - name: Configure Codex for Salesflare APIM
+        if: steps.provider.outputs.ready == 'true'
+        env:
+          APIM_BASE_URL: ${{ vars.AZURE_APIM_BASE_URL_REVIEWER }}
+        run: |
+          set -euo pipefail
+          case "$APIM_BASE_URL" in https://*) ;; *) echo "Invalid APIM base URL." >&2; exit 1 ;; esac
+          CODEX_HOME="$RUNNER_TEMP/codex-home"
+          mkdir -p "$CODEX_HOME" "$RUNNER_TEMP/go-build"
+          cat >"$CODEX_HOME/config.toml" <<EOF
+          model_provider = "salesflare_apim"
+          approval_policy = "never"
+          sandbox_mode = "workspace-write"
+          model_reasoning_effort = "medium"
+
+          [sandbox_workspace_write]
+          writable_roots = ["$RUNNER_TEMP/go-build"]
+          network_access = false
+
+          [model_providers.salesflare_apim]
+          name = "Salesflare APIM"
+          base_url = "$APIM_BASE_URL"
+          wire_api = "responses"
+          requires_openai_auth = false
+          env_http_headers = { "X-APIM-Subscription-Key" = "AZURE_APIM_KEY_REVIEWER" }
+
+          [shell_environment_policy]
+          inherit = "core"
+          ignore_default_excludes = false
+          set = { GOCACHE = "$RUNNER_TEMP/go-build", CGO_ENABLED = "1" }
+          EOF
+          echo "CODEX_HOME=$CODEX_HOME" >>"$GITHUB_ENV"
+          go mod download
+
+      - name: Rebase with AI help
+        id: ai
+        if: steps.provider.outputs.ready == 'true'
+        env:
+          AZURE_APIM_KEY_REVIEWER: ${{ secrets.AZURE_APIM_KEY_REVIEWER }}
+          MODEL: ${{ vars.AZURE_OPENAI_MODEL_REVIEWER }}
+        run: bash .github/fork/ai-resolve.sh
+
+      - name: Open a PR for review and one issue
+        if: always() && steps.open.outputs.open == 'false'
+        env:
+          READY: ${{ steps.provider.outputs.ready }}
+          AI_STATE: ${{ steps.ai.outputs.ai_state }}
+          GATE: ${{ steps.ai.outputs.gate }}
+          BRANCH: ${{ steps.ai.outputs.branch }}
+          WHY: ${{ needs.update.outputs.state == 'conflict' && 'the rebase stopped on a conflict' || 'the rebased code failed the gate' }}
+        run: |
+          set -euo pipefail
+          title="Auto-update to upstream $LATEST needs review"
+          if [ "$READY" = "true" ] && [ "$AI_STATE" = "resolved" ]; then
+            git push --force origin "$BRANCH"
+            {
+              echo "Moving the fork from upstream $BASE to $LATEST: $WHY, so the AI step (Codex via Salesflare APIM) resolved it. Gate after the AI step: **$GATE**."
+              echo
+              echo "Review the diff against \`$LATEST\` (not against main):"
+              echo "\`git diff $LATEST origin/$BRANCH\`"
+              echo
+              echo "To accept, do not merge this PR. Run the **Fork update** workflow with promote = \`$BRANCH\`: it runs the gate again, moves main to this branch, and releases."
+              echo
+              cat "$RUNNER_TEMP/ai-summary.md" 2>/dev/null || true
+              echo
+              echo "Run: $RUN_URL"
+            } >"$RUNNER_TEMP/pr.md"
+            pr=$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url')
+            [ -n "$pr" ] || pr=$(gh pr create --base main --head "$BRANCH" --title "Rebase on upstream $LATEST (AI-resolved, needs review)" --body-file "$RUNNER_TEMP/pr.md")
+            body="Moving to upstream $LATEST: $WHY. The AI step resolved it in $pr (gate: $GATE). Review it, then run Fork update with promote = \`$BRANCH\`. Run: $RUN_URL"
+          elif [ "$READY" != "true" ]; then
+            body="Moving to upstream $LATEST: $WHY, and the AI step is not set up (needs the AZURE_APIM_KEY_REVIEWER secret and the AZURE_APIM_BASE_URL_REVIEWER and AZURE_OPENAI_MODEL_REVIEWER variables). Rebase by hand onto $LATEST, push a branch fork/update-$LATEST, then run Fork update with promote = that branch. Run: $RUN_URL"
+          else
+            body="Moving to upstream $LATEST: $WHY, and the AI step could not resolve it. Rebase by hand onto $LATEST, push a branch fork/update-$LATEST, then run Fork update with promote = that branch. Run: $RUN_URL"
+          fi
+          bash .github/fork/issue.sh "$title" "$body"
+
+  promote:
+    if: ${{ inputs.promote }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+    env:
+      BRANCH: ${{ inputs.promote }}
+    steps:
+      - name: Check the branch name
+        run: |
+          [[ "$BRANCH" =~ ^fork/(ai-)?update-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "promote only fork/update-vX.Y.Z or fork/ai-update-vX.Y.Z branches" >&2; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.promote }}
+          fetch-depth: 0
+          token: ${{ secrets.FORK_BOT_TOKEN || github.token }}
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Gate
+        run: bash .github/fork/test.sh
+
+      - name: Move main
+        run: |
+          set -euo pipefail
+          tag=${BRANCH##*-}
+          git fetch --quiet --no-tags https://github.com/openclaw/wacli.git "+refs/tags/$tag:refs/tags/$tag"
+          git merge-base --is-ancestor "$tag" HEAD || { echo "$BRANCH is not based on upstream $tag" >&2; exit 1; }
+          git push --force origin "HEAD:main"
+
+      - name: Plan the release
+        id: plan
+        run: bash .github/fork/release-plan.sh
+
+  release:
+    needs: [update, promote]
+    if: ${{ always() && (needs.update.outputs.release == 'true' || needs.promote.outputs.release == 'true') }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/fork-release.yml
+    with:
+      sha: ${{ needs.update.outputs.sha || needs.promote.outputs.sha }}
+      tag: ${{ needs.update.outputs.tag || needs.promote.outputs.tag }}
